@@ -154,10 +154,14 @@ class KalmanBoxTracker:
             self.trail.pop(0)
 
     def predict(self):
-        # Prevent negative scale
+        # Prevent negative scale before predicting
         if (self.kf.x[6] + self.kf.x[2]) <= 0:
             self.kf.x[6] = 0.
-        self.kf.predict()
+        x_pred = self.kf.predict()
+        # Clamp predicted scale to avoid degenerate boxes after prediction
+        if x_pred[2] <= 0:
+            x_pred[2] = 1e-3
+            self.kf.x[2] = 1e-3
         self.age += 1
         if self.time_since_update > 0:
             self.hit_streak = 0
@@ -186,8 +190,12 @@ class KalmanBoxTracker:
     @staticmethod
     def _x_to_bbox(x):
         """[cx, cy, s, r, …] → [x1, y1, x2, y2]"""
-        w = np.sqrt(max(x[2] * x[3], 0))
-        h = x[2] / w if w > 0 else 0
+        # s = w * h,  r = w / h  →  w = sqrt(s * r),  h = s / w
+        s = float(x[2])
+        r = float(x[3])
+        r = max(r, 1e-6)          # guard against zero/negative aspect ratio
+        w = np.sqrt(max(s * r, 0))
+        h = s / w if w > 0 else 0.
         return np.array([
             x[0] - w / 2.,
             x[1] - h / 2.,
@@ -260,24 +268,24 @@ def associate_detections_to_trackers(detections, trackers,
     else:
         matched_indices = np.empty((0, 2), dtype=int)
 
-    matched_det_set = set(matched_indices[:, 0]) if len(matched_indices) else set()
-    matched_trk_set = set(matched_indices[:, 1]) if len(matched_indices) else set()
+    matched_det_set = set(matched_indices[:, 0].tolist()) if len(matched_indices) else set()
+    matched_trk_set = set(matched_indices[:, 1].tolist()) if len(matched_indices) else set()
 
     unmatched_dets = [d for d in range(n_det) if d not in matched_det_set]
     unmatched_trks = [t for t in range(n_trk) if t not in matched_trk_set]
 
-    # Filter weak matches
+    # Filter weak matches — push rejected pairs back to unmatched lists
     matches = []
     for m in matched_indices:
         if iou_matrix[m[0], m[1]] < iou_threshold:
-            unmatched_dets.append(m[0])
-            unmatched_trks.append(m[1])
+            unmatched_dets.append(int(m[0]))
+            unmatched_trks.append(int(m[1]))
         else:
             matches.append(m.reshape(1, 2))
 
     matches = np.concatenate(matches, axis=0) if matches else np.empty((0, 2), dtype=int)
 
-    return matches, np.array(unmatched_dets), np.array(unmatched_trks)
+    return matches, np.array(unmatched_dets, dtype=int), np.array(unmatched_trks, dtype=int)
 
 
 # ---------------------------------------------------------------------------
