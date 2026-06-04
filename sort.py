@@ -225,11 +225,7 @@ def associate_detections_to_trackers(detections, trackers, det_classes, trk_clas
                         iou_matrix[d, t] *= 0.25
 
     if min(iou_matrix.shape) > 0:
-        a = (iou_matrix > iou_threshold)
-        if a.all(axis=0).any() or a.all(axis=1).any():
-            matched_indices = linear_assignment(-iou_matrix)
-        else:
-            matched_indices = np.empty((0, 2), dtype=int)
+        matched_indices = linear_assignment(-iou_matrix)
     else:
         matched_indices = np.empty((0, 2), dtype=int)
 
@@ -270,6 +266,8 @@ class Sort:
         self.iou_threshold = iou_threshold
         self.trackers = []
         self.frame_count = 0
+        # Reset tracker ID counter on initialization to prevent ID inflation across runs
+        KalmanBoxTracker.count = 0
 
     def update(self, dets=np.empty((0, 5))):
         """

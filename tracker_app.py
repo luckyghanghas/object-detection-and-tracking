@@ -40,6 +40,7 @@ def parse_args():
 def draw_elegant_box(img, x1, y1, x2, y2, label, color, thickness=2, line_length=15):
     """
     Draws a premium bounding box with modern corner accents and a clean tag.
+    Handles boundary clamping to prevent tags from clipping off-screen.
     """
     # Cast coordinate variables to integer
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -66,23 +67,33 @@ def draw_elegant_box(img, x1, y1, x2, y2, label, color, thickness=2, line_length
     cv2.line(img, (x2, y2), (x2 - line_length, y2), color, thickness)
     cv2.line(img, (x2, y2), (x2, y2 - line_length), color, thickness)
 
-    # Draw text tag above the box
+    # Draw text tag above the box (or inside if near the top edge)
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.5
     text_thickness = 1
     (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, text_thickness)
 
-    # Ensure label background doesn't go out of bounds
-    tag_y1 = max(0, y1 - text_h - 8)
-    tag_y2 = y1
+    # Get frame dimensions to clamp horizontally
+    img_h, img_w = img.shape[:2]
+    text_x1 = max(0, min(x1, img_w - text_w - 10))
+
+    # Adjust vertical tag placement to prevent clipping at the top
+    if y1 < text_h + 15:
+        tag_y1 = y1
+        tag_y2 = y1 + text_h + 8
+        text_y = y1 + text_h + 3
+    else:
+        tag_y1 = y1 - text_h - 8
+        tag_y2 = y1
+        text_y = y1 - 5
 
     # Draw solid tag background
-    cv2.rectangle(img, (x1, tag_y1), (x1 + text_w + 10, tag_y2), color, -1)
+    cv2.rectangle(img, (text_x1, tag_y1), (text_x1 + text_w + 10, tag_y2), color, -1)
     # Draw text inside tag
     cv2.putText(
         img,
         label,
-        (x1 + 5, y1 - 5),
+        (text_x1 + 5, text_y),
         font,
         font_scale,
         (255, 255, 255),
@@ -136,16 +147,18 @@ def main():
     # Get class names dictionary from YOLO
     class_names = model.names
 
-    # Initialize SORT tracker
+    # Initialize SORT tracker with corrected parameters
     print("[INFO] Initializing SORT tracker...")
-    tracker = Sort(max_age=30, min_hits=1, iou_threshold=0.1)
+    tracker = Sort(max_age=30, min_hits=1, iou_threshold=0.3)
 
-    # Define color map for different track IDs for visualization
-    # Using HSL/harmonious colors converted to BGR
+    # Define color map using a cache to avoid slow random-seed recomputations
+    COLOR_CACHE = {}
     def get_color(track_id):
-        np.random.seed(int(track_id))
-        color = np.random.randint(50, 255, size=3).tolist()
-        return tuple(color)
+        if track_id not in COLOR_CACHE:
+            np.random.seed(int(track_id))
+            color = np.random.randint(50, 255, size=3).tolist()
+            COLOR_CACHE[track_id] = tuple(color)
+        return COLOR_CACHE[track_id]
 
     prev_time = 0
     out_writer = None
