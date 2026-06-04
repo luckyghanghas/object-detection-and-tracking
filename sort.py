@@ -1,16 +1,3 @@
-"""
-SORT: Simple Online and Realtime Tracking
-
-Root cause of ID switching: when two boxes barely overlap (IoU ~ 0),
-the Hungarian matcher can't connect them even though they are the same object.
-
-Fix: replace pure IoU cost with a combined cost:
-  score = 0.6 * IoU  +  0.4 * centroid_similarity
-where centroid_similarity = 1 / (1 + normalised_distance).
-
-Even if IoU = 0, a close centroid still produces a valid match.
-"""
-
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
