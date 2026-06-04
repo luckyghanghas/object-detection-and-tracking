@@ -5,18 +5,7 @@ Real-time multi-object detection and tracking for webcam or video files.
 
 ---
 
-## Demo
-
-> Overhead parking-lot footage — person, cyclist, and car tracked simultaneously.
-
-| What you see | What it means |
-|---|---|
-| Coloured corner-accent box | One tracked object |
-| `ID 3 \| person` label | Track ID 3, classified as a person |
-| Fading polyline trail | Recent path of the object's centre |
-| `FPS` + count in top-left HUD | Live performance + object counts per class |
-
----
+ 
 
 ## How it works — the full pipeline
 
