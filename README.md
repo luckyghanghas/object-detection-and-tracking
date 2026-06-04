@@ -10,6 +10,12 @@ This project performs real-time object detection and tracking on webcams or vide
 - **YOLOv8 Detection**: High-performance object detection using Ultralytics YOLOv8.
 - **SORT Tracker**: Frame-by-frame object tracking using a NumPy-based Kalman Filter and SciPy linear sum assignment.
 - **Premium Visualization**: Elegant corners on bounding boxes, unique colors dynamically generated per Track ID, and a semi-transparent HUD showing system FPS.
+- **Wide Range of Objects**: Automatically tracks common daily objects out-of-the-box, including:
+  * 🚶 **People** (`person`)
+  * 🚗 **Vehicles** (`car`, `bicycle`, `motorcycle`, `bus`, `truck`)
+  * 🎒 **Accessories** (`backpack`, `umbrella`, `handbag`)
+  * 🐾 **Animals** (`cat`, `dog`, `horse`, `sheep`, `cow`)
+  * 🛋️ **Indoor items** (`chair`, `sofa`, `bed`, `dining table`, `laptop`, `cell phone`)
 
 ---
 
