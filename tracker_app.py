@@ -138,7 +138,7 @@ def main():
 
     # Initialize SORT tracker
     print("[INFO] Initializing SORT tracker...")
-    tracker = Sort(max_age=25, min_hits=1, iou_threshold=0.3)
+    tracker = Sort(max_age=30, min_hits=1, iou_threshold=0.1)
 
     # Define color map for different track IDs for visualization
     # Using HSL/harmonious colors converted to BGR
