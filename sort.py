@@ -173,10 +173,10 @@ class KalmanBoxTracker:
             return np.array([x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2., score]).reshape((1, 5))
 
 
-def associate_detections_to_trackers(detections, trackers, det_classes, trk_classes, iou_threshold=0.3):
+def associate_detections_to_trackers(detections, trackers, det_classes, trk_classes, active_trackers, iou_threshold=0.3):
     """
     Assigns detections to tracked object (both represented as bounding boxes).
-    Only allows matches between the same class.
+    Only allows matches between the same class and penalizes opposite velocity matches.
     """
     if len(detections) == 0:
         return np.empty((0, 2), dtype=int), np.empty((0,), dtype=int), np.arange(len(trackers))
@@ -186,11 +186,43 @@ def associate_detections_to_trackers(detections, trackers, det_classes, trk_clas
 
     iou_matrix = iou_batch(detections, trackers)
 
-    # Enforce same-class matching by zeroing out IoU for mismatched classes
+    # Enforce same-class matching and velocity consistency
     for d in range(len(detections)):
+        det_box = detections[d]
+        det_cx = (det_box[0] + det_box[2]) / 2.0
+        det_cy = (det_box[1] + det_box[3]) / 2.0
+        
         for t in range(len(trackers)):
+            # 1. Enforce Class Constraints
             if det_classes[d] != trk_classes[t]:
                 iou_matrix[d, t] = 0.0
+                continue
+                
+            # 2. Enforce Velocity Direction Consistency
+            # If the tracker has been tracked for a while, it has a reliable velocity
+            trk_obj = active_trackers[t]
+            if trk_obj.hits > 3:
+                # Get predicted velocities from Kalman Filter: vx (index 4), vy (index 5)
+                vx = trk_obj.kf.x[4, 0]
+                vy = trk_obj.kf.x[5, 0]
+                
+                # Get predicted center position from Kalman Filter: x (index 0), y (index 1)
+                pred_cx = trk_obj.kf.x[0, 0]
+                pred_cy = trk_obj.kf.x[1, 0]
+                
+                # Vector from predicted position to the proposed detection
+                dx = det_cx - pred_cx
+                dy = det_cy - pred_cy
+                
+                # If moving (velocity is non-negligible)
+                vel_magnitude = np.sqrt(vx**2 + vy**2)
+                if vel_magnitude > 2.0:
+                    # Dot product between velocity vector and displacement vector
+                    dot_product = (vx * dx) + (vy * dy)
+                    # If dot product is negative, the detection is in the opposite direction of motion
+                    if dot_product < 0:
+                        # Penalize the match by halving the IoU or reducing it
+                        iou_matrix[d, t] *= 0.25
 
     if min(iou_matrix.shape) > 0:
         a = (iou_matrix > iou_threshold)
@@ -271,7 +303,7 @@ class Sort:
         trk_classes = np.array([tracker.class_id for tracker in self.trackers])
 
         matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(
-            dets_boxes, trks[:, :4], det_classes, trk_classes, self.iou_threshold
+            dets_boxes, trks[:, :4], det_classes, trk_classes, self.trackers, self.iou_threshold
         )
 
         # Update matched trackers with assigned detections
