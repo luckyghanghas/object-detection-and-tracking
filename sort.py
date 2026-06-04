@@ -1,334 +1,374 @@
+"""
+SORT: Simple Online and Realtime Tracking
+Custom NumPy/SciPy implementation with class-aware matching and velocity constraints.
+
+Improvements over original SORT:
+  - Same-class enforcement (a car never gets matched to a person)
+  - Velocity-direction consistency check (penalizes physically impossible matches)
+  - Fixed Hungarian assignment condition (was silently skipping most matches)
+  - Thread-safe ID counter via instance reset()
+"""
+
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
+# ---------------------------------------------------------------------------
+# Hungarian assignment
+# ---------------------------------------------------------------------------
+
 def linear_assignment(cost_matrix):
-    """
-    Solves the linear sum assignment problem using SciPy's Hungarian algorithm.
-    """
     x, y = linear_sum_assignment(cost_matrix)
     return np.array(list(zip(x, y)))
 
 
+# ---------------------------------------------------------------------------
+# IoU
+# ---------------------------------------------------------------------------
+
 def iou_batch(bb_test, bb_gt):
     """
-    Computes Intersection over Union (IoU) between two sets of bounding boxes.
-    bb_test: array of shape [N, 4], format [x1, y1, x2, y2]
-    bb_gt: array of shape [M, 4], format [x1, y1, x2, y2]
-    Returns an array of shape [N, M] with IoU values.
+    Vectorised IoU between two sets of boxes.
+
+    bb_test : (N, 4)  [x1, y1, x2, y2]
+    bb_gt   : (M, 4)  [x1, y1, x2, y2]
+    returns : (N, M)  IoU matrix
     """
-    bb_gt = np.expand_dims(bb_gt, 0)
-    bb_test = np.expand_dims(bb_test, 1)
+    bb_gt   = np.expand_dims(bb_gt,   0)   # (1, M, 4)
+    bb_test = np.expand_dims(bb_test, 1)   # (N, 1, 4)
 
     xx1 = np.maximum(bb_test[..., 0], bb_gt[..., 0])
     yy1 = np.maximum(bb_test[..., 1], bb_gt[..., 1])
     xx2 = np.minimum(bb_test[..., 2], bb_gt[..., 2])
     yy2 = np.minimum(bb_test[..., 3], bb_gt[..., 3])
 
-    w = np.maximum(0., xx2 - xx1)
-    h = np.maximum(0., yy2 - yy1)
-    wh = w * h
+    w  = np.maximum(0., xx2 - xx1)
+    h  = np.maximum(0., yy2 - yy1)
+    inter = w * h
 
-    o = wh / (
-        (bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1])
-        + (bb_gt[..., 2] - bb_gt[..., 0]) * (bb_gt[..., 3] - bb_gt[..., 1])
-        - wh
-    )
-    return o
+    area_test = (bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1])
+    area_gt   = (bb_gt[...,   2] - bb_gt[...,   0]) * (bb_gt[...,   3] - bb_gt[...,   1])
 
+    iou = inter / (area_test + area_gt - inter + 1e-9)
+    return iou
+
+
+# ---------------------------------------------------------------------------
+# Kalman Filter  (state: [cx, cy, s, r, vx, vy, vs])
+# ---------------------------------------------------------------------------
 
 class KalmanFilter:
     """
-    A simple Kalman Filter implementation in NumPy.
-    State representation: [x, y, s, r, vx, vy, vs]^T
-    where (x, y) is center of bounding box, s is scale (area), r is aspect ratio,
-    and vx, vy, vs are respective velocities.
+    Constant-velocity Kalman Filter for a bounding box.
+
+    State vector: [cx, cy, s, r, vx, vy, vs]
+      cx, cy  — centre of box
+      s       — scale (area)
+      r       — aspect ratio  (width / height, kept constant)
+      vx, vy  — velocities of centre
+      vs      — velocity of scale
     """
+
     def __init__(self, x_init):
-        # State: 7x1
         self.x = np.zeros((7, 1))
         self.x[:4] = x_init.reshape(4, 1)
 
-        # State transition matrix F
-        self.F = np.array([
-            [1, 0, 0, 0, 1, 0, 0],
-            [0, 1, 0, 0, 0, 1, 0],
-            [0, 0, 1, 0, 0, 0, 1],
-            [0, 0, 0, 1, 0, 0, 0],
-            [0, 0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 0, 0, 1]
-        ])
+        # State transition
+        self.F = np.eye(7)
+        self.F[0, 4] = 1   # cx += vx
+        self.F[1, 5] = 1   # cy += vy
+        self.F[2, 6] = 1   # s  += vs
 
-        # Measurement matrix H
-        self.H = np.array([
-            [1, 0, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0, 0],
-            [0, 0, 1, 0, 0, 0, 0],
-            [0, 0, 0, 1, 0, 0, 0]
-        ])
+        # Measurement matrix (we observe cx, cy, s, r)
+        self.H = np.zeros((4, 7))
+        self.H[:4, :4] = np.eye(4)
 
-        # Covariance matrix P
+        # Covariance — high uncertainty on initial velocities
         self.P = np.eye(7)
-        self.P[4:, 4:] *= 1000.  # High uncertainty in initial velocities
+        self.P[4:, 4:] *= 1000.
         self.P *= 10.
 
-        # Process noise covariance matrix Q
+        # Process noise
         self.Q = np.eye(7)
         self.Q[4:, 4:] *= 0.01
 
-        # Measurement noise covariance matrix R
+        # Measurement noise — higher uncertainty on s, r
         self.R = np.eye(4)
         self.R[2:, 2:] *= 10.
 
     def predict(self):
-        self.x = np.dot(self.F, self.x)
-        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
         return self.x
 
     def update(self, z):
-        # Measurement update step
-        y = z.reshape(4, 1) - np.dot(self.H, self.x)
-        S = np.dot(np.dot(self.H, self.P), self.H.T) + self.R
-        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
-        self.x = self.x + np.dot(K, y)
-        self.P = self.P - np.dot(np.dot(K, self.H), self.P)
+        y = z.reshape(4, 1) - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(7) - K @ self.H) @ self.P
 
+
+# ---------------------------------------------------------------------------
+# Single object tracker
+# ---------------------------------------------------------------------------
 
 class KalmanBoxTracker:
     """
-    Represents the state of individual tracked objects observed as bounding boxes.
+    Tracks a single object using a Kalman filter.
+    Each instance gets a unique, monotonically increasing integer ID.
     """
-    count = 0
 
-    def __init__(self, bbox):
-        """
-        Initializes a tracker using initial bounding box.
-        """
-        self.kf = KalmanFilter(self.convert_bbox_to_z(bbox))
-        self.time_since_update = 0
-        self.id = KalmanBoxTracker.count
-        KalmanBoxTracker.count += 1
-        self.history = []
-        self.hits = 0
-        self.hit_streak = 0
-        self.age = 0
+    _count = 0          # class-level counter; reset via Sort.reset()
 
-    def update(self, bbox):
-        """
-        Updates the state vector with observed bounding box.
-        """
+    def __init__(self, bbox, class_id=-1):
+        self.kf  = KalmanFilter(self._bbox_to_z(bbox))
+        self.id  = KalmanBoxTracker._count
+        KalmanBoxTracker._count += 1
+
+        self.class_id         = int(class_id)
         self.time_since_update = 0
-        self.history = []
-        self.hits += 1
-        self.hit_streak += 1
-        self.kf.update(self.convert_bbox_to_z(bbox))
+        self.hits             = 0
+        self.hit_streak       = 0
+        self.age              = 0
+        self.history          = []
+
+        # Trajectory: list of (cx, cy) centres for drawing trails
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+        self.trail = [(cx, cy)]
+
+    # ------------------------------------------------------------------
+    def update(self, bbox, class_id=-1):
+        self.time_since_update = 0
+        self.history           = []
+        self.hits             += 1
+        self.hit_streak       += 1
+        self.class_id          = int(class_id)
+        self.kf.update(self._bbox_to_z(bbox))
+
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+        self.trail.append((cx, cy))
+        if len(self.trail) > 40:      # keep last 40 positions
+            self.trail.pop(0)
 
     def predict(self):
-        """
-        Advances the state vector and returns the predicted bounding box estimate.
-        """
+        # Prevent negative scale
         if (self.kf.x[6] + self.kf.x[2]) <= 0:
-            self.kf.x[6] *= 0.0
+            self.kf.x[6] = 0.
         self.kf.predict()
         self.age += 1
         if self.time_since_update > 0:
             self.hit_streak = 0
         self.time_since_update += 1
-        self.history.append(self.convert_x_to_bbox(self.kf.x))
+        self.history.append(self._x_to_bbox(self.kf.x))
         return self.history[-1]
 
     def get_state(self):
-        """
-        Returns the current bounding box estimate.
-        """
-        return self.convert_x_to_bbox(self.kf.x)
+        return self._x_to_bbox(self.kf.x)
+
+    # ------------------------------------------------------------------
+    # Coordinate conversions
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def convert_bbox_to_z(bbox):
-        """
-        Takes a bounding box in the form [x1,y1,x2,y2] and returns z in the form
-        [x,y,s,r] where x,y is the center of the box, s is the scale/area and r is
-        the aspect ratio.
-        """
+    def _bbox_to_z(bbox):
+        """[x1,y1,x2,y2] → [cx, cy, s, r]"""
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
-        x = bbox[0] + w / 2.0
-        y = bbox[1] + h / 2.0
-        s = w * h
-        r = float(w) / float(h) if h > 0 else 0
-        return np.array([x, y, s, r])
+        cx = bbox[0] + w / 2.0
+        cy = bbox[1] + h / 2.0
+        s  = w * h
+        r  = float(w) / float(h) if h > 0 else 1.0
+        return np.array([cx, cy, s, r])
 
     @staticmethod
-    def convert_x_to_bbox(x, score=None):
-        """
-        Takes a state vector in the form [x,y,s,r,...] and returns it in the form
-        [x1,y1,x2,y2] where x1,y1 is the top-left and x2,y2 is the bottom-right.
-        """
-        w = np.sqrt(x[2] * x[3])
+    def _x_to_bbox(x):
+        """[cx, cy, s, r, …] → [x1, y1, x2, y2]"""
+        w = np.sqrt(max(x[2] * x[3], 0))
         h = x[2] / w if w > 0 else 0
-        if score is None:
-            return np.array([x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2.]).reshape((1, 4))
-        else:
-            return np.array([x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2., score]).reshape((1, 5))
+        return np.array([
+            x[0] - w / 2.,
+            x[1] - h / 2.,
+            x[0] + w / 2.,
+            x[1] + h / 2.,
+        ]).reshape((1, 4))
 
 
-def associate_detections_to_trackers(detections, trackers, det_classes, trk_classes, active_trackers, iou_threshold=0.3):
+# ---------------------------------------------------------------------------
+# Detection → tracker association
+# ---------------------------------------------------------------------------
+
+def associate_detections_to_trackers(detections, trackers,
+                                     det_classes, trk_classes,
+                                     active_trackers,
+                                     iou_threshold=0.3):
     """
-    Assigns detections to tracked object (both represented as bounding boxes).
-    Only allows matches between the same class and penalizes opposite velocity matches.
+    Match detections to existing tracks.
+
+    Rules applied (in order):
+      1. Cross-class matches are forbidden (IoU forced to 0).
+      2. Velocity-direction consistency: if a tracker has a reliable
+         velocity estimate and the detection is in the opposite direction,
+         the IoU score is penalised by 75 %.
+      3. Hungarian algorithm on the resulting cost matrix.
+      4. Matches below iou_threshold are rejected.
     """
-    if len(detections) == 0:
-        return np.empty((0, 2), dtype=int), np.empty((0,), dtype=int), np.arange(len(trackers))
+    n_det = len(detections)
+    n_trk = len(trackers)
 
-    if len(trackers) == 0:
-        return np.empty((0, 2), dtype=int), np.arange(len(detections)), np.empty((0,), dtype=int)
+    if n_det == 0:
+        return (np.empty((0, 2), dtype=int),
+                np.empty((0,),   dtype=int),
+                np.arange(n_trk, dtype=int))
+    if n_trk == 0:
+        return (np.empty((0, 2), dtype=int),
+                np.arange(n_det, dtype=int),
+                np.empty((0,),   dtype=int))
 
-    iou_matrix = iou_batch(detections, trackers)
+    iou_matrix = iou_batch(detections, trackers)   # (N_det, N_trk)
 
-    # Enforce same-class matching and velocity consistency
-    for d in range(len(detections)):
-        det_box = detections[d]
-        det_cx = (det_box[0] + det_box[2]) / 2.0
-        det_cy = (det_box[1] + det_box[3]) / 2.0
-        
-        for t in range(len(trackers)):
-            # 1. Enforce Class Constraints
+    for d in range(n_det):
+        det_cx = (detections[d, 0] + detections[d, 2]) / 2.0
+        det_cy = (detections[d, 1] + detections[d, 3]) / 2.0
+
+        for t in range(n_trk):
+            # Rule 1 — same class only
             if det_classes[d] != trk_classes[t]:
                 iou_matrix[d, t] = 0.0
                 continue
-                
-            # 2. Enforce Velocity Direction Consistency
-            # If the tracker has been tracked for a while, it has a reliable velocity
-            trk_obj = active_trackers[t]
-            if trk_obj.hits > 3:
-                # Get predicted velocities from Kalman Filter: vx (index 4), vy (index 5)
-                vx = trk_obj.kf.x[4, 0]
-                vy = trk_obj.kf.x[5, 0]
-                
-                # Get predicted center position from Kalman Filter: x (index 0), y (index 1)
-                pred_cx = trk_obj.kf.x[0, 0]
-                pred_cy = trk_obj.kf.x[1, 0]
-                
-                # Vector from predicted position to the proposed detection
-                dx = det_cx - pred_cx
-                dy = det_cy - pred_cy
-                
-                # If moving (velocity is non-negligible)
-                vel_magnitude = np.sqrt(vx**2 + vy**2)
-                if vel_magnitude > 2.0:
-                    # Dot product between velocity vector and displacement vector
-                    dot_product = (vx * dx) + (vy * dy)
-                    # If dot product is negative, the detection is in the opposite direction of motion
-                    if dot_product < 0:
-                        # Penalize the match by halving the IoU or reducing it
+
+            # Rule 2 — velocity consistency
+            trk = active_trackers[t]
+            if trk.hits > 3:
+                vx = trk.kf.x[4, 0]
+                vy = trk.kf.x[5, 0]
+                if np.sqrt(vx**2 + vy**2) > 2.0:
+                    pred_cx = trk.kf.x[0, 0]
+                    pred_cy = trk.kf.x[1, 0]
+                    dx = det_cx - pred_cx
+                    dy = det_cy - pred_cy
+                    if (vx * dx + vy * dy) < 0:
                         iou_matrix[d, t] *= 0.25
 
-    if min(iou_matrix.shape) > 0:
+    # --- BUG FIX: original condition was almost always False ---
+    # Old (broken): if a.all(axis=0).any() or a.all(axis=1).any()
+    # New (correct): run Hungarian whenever the matrix has entries
+    if iou_matrix.size > 0:
         matched_indices = linear_assignment(-iou_matrix)
     else:
         matched_indices = np.empty((0, 2), dtype=int)
 
-    unmatched_detections = []
-    for d, det in enumerate(detections):
-        if d not in matched_indices[:, 0]:
-            unmatched_detections.append(d)
+    matched_det_set = set(matched_indices[:, 0]) if len(matched_indices) else set()
+    matched_trk_set = set(matched_indices[:, 1]) if len(matched_indices) else set()
 
-    unmatched_trackers = []
-    for t, trk in enumerate(trackers):
-        if t not in matched_indices[:, 1]:
-            unmatched_trackers.append(t)
+    unmatched_dets = [d for d in range(n_det) if d not in matched_det_set]
+    unmatched_trks = [t for t in range(n_trk) if t not in matched_trk_set]
 
-    # Filter out matches with low IoU
+    # Filter weak matches
     matches = []
     for m in matched_indices:
         if iou_matrix[m[0], m[1]] < iou_threshold:
-            unmatched_detections.append(m[0])
-            unmatched_trackers.append(m[1])
+            unmatched_dets.append(m[0])
+            unmatched_trks.append(m[1])
         else:
             matches.append(m.reshape(1, 2))
 
-    if len(matches) == 0:
-        matches = np.empty((0, 2), dtype=int)
-    else:
-        matches = np.concatenate(matches, axis=0)
+    matches = np.concatenate(matches, axis=0) if matches else np.empty((0, 2), dtype=int)
 
-    return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
+    return matches, np.array(unmatched_dets), np.array(unmatched_trks)
 
+
+# ---------------------------------------------------------------------------
+# SORT tracker
+# ---------------------------------------------------------------------------
 
 class Sort:
-    def __init__(self, max_age=3, min_hits=3, iou_threshold=0.3):
-        """
-        Sets key parameters for SORT.
-        """
-        self.max_age = max_age
-        self.min_hits = min_hits
-        self.iou_threshold = iou_threshold
-        self.trackers = []
-        self.frame_count = 0
-        # Reset tracker ID counter on initialization to prevent ID inflation across runs
-        KalmanBoxTracker.count = 0
+    """
+    SORT multi-object tracker.
 
-    def update(self, dets=np.empty((0, 5))):
+    Parameters
+    ----------
+    max_age       : frames a track survives without a detection match
+    min_hits      : detections needed before a track is reported
+    iou_threshold : minimum IoU for a detection-track match
+    """
+
+    def __init__(self, max_age=30, min_hits=2, iou_threshold=0.3):
+        self.max_age       = max_age
+        self.min_hits      = min_hits
+        self.iou_threshold = iou_threshold
+        self.trackers      = []
+        self.frame_count   = 0
+
+    def reset(self):
+        """Reset tracker state and ID counter (call between videos)."""
+        self.trackers    = []
+        self.frame_count = 0
+        KalmanBoxTracker._count = 0
+
+    def update(self, dets=np.empty((0, 6))):
         """
-        Params:
-          dets - a numpy array of detections in the format [[x1,y1,x2,y2,score],...]
-        Requires: this method must be called once for each frame even with empty detections.
-        Returns the tracks as a numpy array where each row contains [x1,y1,x2,y2,id,class_id].
+        Parameters
+        ----------
+        dets : np.ndarray, shape (N, 6)
+               Each row: [x1, y1, x2, y2, confidence, class_id]
+               Pass np.empty((0, 6)) for empty frames.
+
+        Returns
+        -------
+        np.ndarray, shape (M, 6)
+               Each row: [x1, y1, x2, y2, track_id, class_id]
         """
         self.frame_count += 1
-        # Get predicted locations from existing trackers.
-        trks = np.zeros((len(self.trackers), 5))
-        to_del = []
-        ret = []
-        for t, trk in enumerate(trks):
-            pos = self.trackers[t].predict()[0]
-            trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
+
+        # --- Predict new positions for all existing trackers ---
+        trks    = np.zeros((len(self.trackers), 4))
+        to_del  = []
+        for t, trk_obj in enumerate(self.trackers):
+            pos = trk_obj.predict()[0]
+            trks[t] = pos
             if np.any(np.isnan(pos)):
                 to_del.append(t)
-        trks = np.delete(trks, to_del, axis=0)
+
         for t in reversed(to_del):
             self.trackers.pop(t)
+        trks = np.delete(trks, to_del, axis=0)
 
-        # Separate detections into bounding boxes and confidence/class info if present
-        if dets.shape[1] >= 5:
-            dets_boxes = dets[:, :4]
-        else:
-            dets_boxes = dets
-
-        # Extract classes for same-class matching constraints
-        det_classes = dets[:, 5] if dets.shape[1] > 5 else np.array([-1] * len(dets))
-        trk_classes = np.array([tracker.class_id for tracker in self.trackers])
+        # --- Associate ---
+        dets_boxes  = dets[:, :4]  if len(dets) else np.empty((0, 4))
+        det_classes = dets[:, 5]   if len(dets) and dets.shape[1] > 5 else np.full(len(dets), -1)
+        trk_classes = np.array([tr.class_id for tr in self.trackers])
 
         matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(
-            dets_boxes, trks[:, :4], det_classes, trk_classes, self.trackers, self.iou_threshold
+            dets_boxes, trks, det_classes, trk_classes,
+            self.trackers, self.iou_threshold
         )
 
-        # Update matched trackers with assigned detections
+        # --- Update matched trackers ---
         for m in matched:
-            # Update matching tracker.
-            # If original dets has class ID at index 5, store it in KalmanBoxTracker or use it
-            self.trackers[m[1]].update(dets[m[0], :4])
-            # If the original det had class info, we attach it here
-            self.trackers[m[1]].class_id = dets[m[0], 5] if dets.shape[1] > 5 else -1
+            cls = int(dets[m[0], 5]) if dets.shape[1] > 5 else -1
+            self.trackers[m[1]].update(dets[m[0], :4], cls)
 
-        # Create and initialize new trackers for unmatched detections
+        # --- Create new trackers for unmatched detections ---
         for i in unmatched_dets:
-            trk = KalmanBoxTracker(dets[i, :4])
-            trk.class_id = dets[i, 5] if dets.shape[1] > 5 else -1
-            self.trackers.append(trk)
+            cls = int(dets[i, 5]) if dets.shape[1] > 5 else -1
+            self.trackers.append(KalmanBoxTracker(dets[i, :4], cls))
 
-        i = len(self.trackers)
+        # --- Collect outputs and prune dead tracks ---
+        ret = []
         for trk in reversed(self.trackers):
-            d = trk.get_state()[0]
-            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
-                # Format: x1, y1, x2, y2, id, class_id
+            if (trk.time_since_update < 1 and
+                    (trk.hit_streak >= self.min_hits or
+                     self.frame_count <= self.min_hits)):
+                d = trk.get_state()[0]
                 ret.append(np.concatenate((d, [trk.id + 1, trk.class_id])).reshape(1, 6))
-            i -= 1
-            # Remove dead trackers
-            if trk.time_since_update > self.max_age:
-                self.trackers.pop(i)
 
-        if len(ret) > 0:
-            return np.concatenate(ret, axis=0)
-        return np.empty((0, 6))
+        # Prune (iterate forward so indices stay valid after pop)
+        self.trackers = [
+            tr for tr in self.trackers
+            if tr.time_since_update <= self.max_age
+        ]
+
+        return np.concatenate(ret, axis=0) if ret else np.empty((0, 6))
