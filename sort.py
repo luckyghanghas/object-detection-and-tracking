@@ -2,29 +2,24 @@
 SORT: Simple Online and Realtime Tracking
 Custom NumPy/SciPy implementation with class-aware matching and velocity constraints.
 
-Improvements over original SORT:
-  - Same-class enforcement (a car never gets matched to a person)
-  - Velocity-direction consistency check (penalizes physically impossible matches)
-  - Fixed Hungarian assignment condition (was silently skipping most matches)
-  - Thread-safe ID counter via instance reset()
+Fixes in this version:
+  - IoU threshold lowered to 0.2 (was 0.3) — prevents ID switches on partial occlusion
+  - min_hits default = 1 — labels appear on first confirmed detection
+  - Same-class check uses int cast to avoid float comparison mismatch (e.g. 0.0 != 0)
+  - Tracker class_id initialised to -1; class check skipped when either side is -1
+  - Velocity penalty removed entirely — was killing valid matches on slow objects
+  - _x_to_bbox flattens (7,1) state vector before indexing (fixes TypeError)
+  - predict() uses [row, 0] indexing throughout for safety
 """
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-# ---------------------------------------------------------------------------
-# Hungarian assignment
-# ---------------------------------------------------------------------------
-
 def linear_assignment(cost_matrix):
     x, y = linear_sum_assignment(cost_matrix)
     return np.array(list(zip(x, y)))
 
-
-# ---------------------------------------------------------------------------
-# IoU
-# ---------------------------------------------------------------------------
 
 def iou_batch(bb_test, bb_gt):
     bb_gt   = np.expand_dims(bb_gt,   0)
@@ -35,20 +30,15 @@ def iou_batch(bb_test, bb_gt):
     xx2 = np.minimum(bb_test[..., 2], bb_gt[..., 2])
     yy2 = np.minimum(bb_test[..., 3], bb_gt[..., 3])
 
-    w  = np.maximum(0., xx2 - xx1)
-    h  = np.maximum(0., yy2 - yy1)
+    w     = np.maximum(0., xx2 - xx1)
+    h     = np.maximum(0., yy2 - yy1)
     inter = w * h
 
     area_test = (bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1])
     area_gt   = (bb_gt[...,   2] - bb_gt[...,   0]) * (bb_gt[...,   3] - bb_gt[...,   1])
 
-    iou = inter / (area_test + area_gt - inter + 1e-9)
-    return iou
+    return inter / (area_test + area_gt - inter + 1e-9)
 
-
-# ---------------------------------------------------------------------------
-# Kalman Filter  (state: [cx, cy, s, r, vx, vy, vs])
-# ---------------------------------------------------------------------------
 
 class KalmanFilter:
     def __init__(self, x_init):
@@ -86,16 +76,12 @@ class KalmanFilter:
         self.P = (np.eye(7) - K @ self.H) @ self.P
 
 
-# ---------------------------------------------------------------------------
-# Single object tracker
-# ---------------------------------------------------------------------------
-
 class KalmanBoxTracker:
     _count = 0
 
     def __init__(self, bbox, class_id=-1):
-        self.kf  = KalmanFilter(self._bbox_to_z(bbox))
-        self.id  = KalmanBoxTracker._count
+        self.kf               = KalmanFilter(self._bbox_to_z(bbox))
+        self.id               = KalmanBoxTracker._count
         KalmanBoxTracker._count += 1
 
         self.class_id          = int(class_id)
@@ -124,13 +110,11 @@ class KalmanBoxTracker:
             self.trail.pop(0)
 
     def predict(self):
-        # Prevent negative scale before predicting
         if (self.kf.x[6, 0] + self.kf.x[2, 0]) <= 0:
             self.kf.x[6, 0] = 0.
         x_pred = self.kf.predict()
-        # Clamp predicted scale to avoid degenerate boxes
         if x_pred[2, 0] <= 0:
-            x_pred[2, 0] = 1e-3
+            x_pred[2, 0]    = 1e-3
             self.kf.x[2, 0] = 1e-3
         self.age += 1
         if self.time_since_update > 0:
@@ -144,7 +128,6 @@ class KalmanBoxTracker:
 
     @staticmethod
     def _bbox_to_z(bbox):
-        """[x1,y1,x2,y2] → [cx, cy, s, r]"""
         w  = bbox[2] - bbox[0]
         h  = bbox[3] - bbox[1]
         cx = bbox[0] + w / 2.0
@@ -155,15 +138,12 @@ class KalmanBoxTracker:
 
     @staticmethod
     def _x_to_bbox(x):
-        """[cx, cy, s, r, …] → [x1, y1, x2, y2]"""
-        # x has shape (7, 1) — flatten so indexing gives scalars
-        x = x.flatten()
-        # s = w*h, r = w/h  →  w = sqrt(s*r), h = s/w
+        x = x.flatten()          # (7,1) → (7,) so x[i] is a scalar
         s = float(x[2])
         r = float(x[3])
         r = max(r, 1e-6)
-        w = np.sqrt(max(s * r, 0))
-        h = s / w if w > 0 else 0.
+        w = np.sqrt(max(s * r, 0.))
+        h = (s / w) if w > 0 else 0.
         return np.array([
             x[0] - w / 2.,
             x[1] - h / 2.,
@@ -172,14 +152,10 @@ class KalmanBoxTracker:
         ]).reshape((1, 4))
 
 
-# ---------------------------------------------------------------------------
-# Detection → tracker association
-# ---------------------------------------------------------------------------
-
 def associate_detections_to_trackers(detections, trackers,
                                      det_classes, trk_classes,
                                      active_trackers,
-                                     iou_threshold=0.3):
+                                     iou_threshold=0.2):
     n_det = len(detections)
     n_trk = len(trackers)
 
@@ -194,31 +170,17 @@ def associate_detections_to_trackers(detections, trackers,
 
     iou_matrix = iou_batch(detections, trackers)
 
+    # Block cross-class pairs only when BOTH sides have a known class (>= 0)
     for d in range(n_det):
-        det_cx = (detections[d, 0] + detections[d, 2]) / 2.0
-        det_cy = (detections[d, 1] + detections[d, 3]) / 2.0
-
+        dc = int(det_classes[d])
         for t in range(n_trk):
-            if det_classes[d] != trk_classes[t]:
+            tc = int(trk_classes[t])
+            if dc >= 0 and tc >= 0 and dc != tc:
                 iou_matrix[d, t] = 0.0
-                continue
 
-            trk = active_trackers[t]
-            if trk.hits > 3:
-                vx = trk.kf.x[4, 0]
-                vy = trk.kf.x[5, 0]
-                if np.sqrt(vx**2 + vy**2) > 2.0:
-                    pred_cx = trk.kf.x[0, 0]
-                    pred_cy = trk.kf.x[1, 0]
-                    dx = det_cx - pred_cx
-                    dy = det_cy - pred_cy
-                    if (vx * dx + vy * dy) < 0:
-                        iou_matrix[d, t] *= 0.25
-
-    if iou_matrix.size > 0:
-        matched_indices = linear_assignment(-iou_matrix)
-    else:
-        matched_indices = np.empty((0, 2), dtype=int)
+    matched_indices = (linear_assignment(-iou_matrix)
+                       if iou_matrix.size > 0
+                       else np.empty((0, 2), dtype=int))
 
     matched_det_set = set(matched_indices[:, 0].tolist()) if len(matched_indices) else set()
     matched_trk_set = set(matched_indices[:, 1].tolist()) if len(matched_indices) else set()
@@ -234,17 +196,16 @@ def associate_detections_to_trackers(detections, trackers,
         else:
             matches.append(m.reshape(1, 2))
 
-    matches = np.concatenate(matches, axis=0) if matches else np.empty((0, 2), dtype=int)
+    matches = (np.concatenate(matches, axis=0)
+               if matches else np.empty((0, 2), dtype=int))
 
-    return matches, np.array(unmatched_dets, dtype=int), np.array(unmatched_trks, dtype=int)
+    return (matches,
+            np.array(unmatched_dets, dtype=int),
+            np.array(unmatched_trks, dtype=int))
 
-
-# ---------------------------------------------------------------------------
-# SORT tracker
-# ---------------------------------------------------------------------------
 
 class Sort:
-    def __init__(self, max_age=30, min_hits=2, iou_threshold=0.3):
+    def __init__(self, max_age=30, min_hits=1, iou_threshold=0.2):
         self.max_age       = max_age
         self.min_hits      = min_hits
         self.iou_threshold = iou_threshold
@@ -272,7 +233,8 @@ class Sort:
         trks = np.delete(trks, to_del, axis=0)
 
         dets_boxes  = dets[:, :4] if len(dets) else np.empty((0, 4))
-        det_classes = dets[:, 5]  if len(dets) and dets.shape[1] > 5 else np.full(len(dets), -1)
+        det_classes = (dets[:, 5] if len(dets) and dets.shape[1] > 5
+                       else np.full(len(dets), -1))
         trk_classes = np.array([tr.class_id for tr in self.trackers])
 
         matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(
@@ -294,7 +256,9 @@ class Sort:
                     (trk.hit_streak >= self.min_hits or
                      self.frame_count <= self.min_hits)):
                 d = trk.get_state()[0]
-                ret.append(np.concatenate((d, [trk.id + 1, trk.class_id])).reshape(1, 6))
+                ret.append(
+                    np.concatenate((d, [trk.id + 1, trk.class_id])).reshape(1, 6)
+                )
 
         self.trackers = [
             tr for tr in self.trackers
