@@ -1,0 +1,11 @@
+# Python cache files
+__pycache__/
+*.pyc
+
+# YOLO Model Weights (automatically downloaded by the script)
+*.pt
+
+# Video/Media files (downloaded for testing)
+*.mp4
+*.avi
+*.mkv
