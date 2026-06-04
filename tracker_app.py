@@ -99,6 +99,19 @@ def main():
     if source.isdigit():
         source = int(source)
 
+    # Automatically download sample.mp4 if requested but missing
+    if source == "sample.mp4":
+        import os
+        if not os.path.exists(source):
+            print(f"[INFO] '{source}' not found. Downloading sample video...")
+            import urllib.request
+            url = "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4"
+            try:
+                urllib.request.urlretrieve(url, source)
+                print(f"[INFO] '{source}' downloaded successfully.")
+            except Exception as e:
+                print(f"[ERROR] Failed to download sample video: {e}")
+
     print(f"[INFO] Initializing webcam/video source: {source}...")
     
     # Use cv2.CAP_DSHOW backend on Windows for reliable webcam access
@@ -111,6 +124,16 @@ def main():
     if not cap.isOpened() and isinstance(source, int):
         print(f"[WARNING] Could not open webcam at index {source} with DirectShow. Falling back to 'sample.mp4'...")
         source = "sample.mp4"
+        import os
+        if not os.path.exists(source):
+            print(f"[INFO] '{source}' not found. Downloading sample video...")
+            import urllib.request
+            url = "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4"
+            try:
+                urllib.request.urlretrieve(url, source)
+                print(f"[INFO] '{source}' downloaded successfully.")
+            except Exception as e:
+                print(f"[ERROR] Failed to download sample video: {e}")
         cap = cv2.VideoCapture(source)
 
     if not cap.isOpened():
