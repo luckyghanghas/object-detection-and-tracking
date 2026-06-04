@@ -1,5 +1,7 @@
 # Object Detection and Tracking with YOLO & SORT
 
+![Object Tracking Demo](screenshot.png)
+
 This project performs real-time object detection and tracking on webcams or video files. It leverages a pre-trained **YOLOv8** model for high-speed object detection and a custom, dependency-free implementation of the **SORT (Simple Online and Realtime Tracking)** algorithm utilizing Kalman Filters and Hungarian association.
 
 ## Features
