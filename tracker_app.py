@@ -1,5 +1,33 @@
+"""
+Real-time Object Detection and Tracking
+========================================
+YOLOv8  +  Custom SORT (Kalman Filter + Hungarian Assignment)
+
+Features
+--------
+  - Webcam or video file input
+  - GPU acceleration when available (auto-detected)
+  - Elegant corner-accent bounding boxes, per-ID colour
+  - Motion trail (last N centre points per track)
+  - Per-class object count overlay
+  - Benchmark mode: prints FPS, ID-switch count, max simultaneous tracks
+  - Headless mode: writes output.mp4 when no display is available
+  - Tracker resets between runs (no ID bleed-over)
+
+Usage
+-----
+  python tracker_app.py                          # webcam
+  python tracker_app.py --source video.mp4       # video file
+  python tracker_app.py --source video.mp4 --benchmark
+  python tracker_app.py --classes 0 2            # person + car only
+  python tracker_app.py --model yolov8s.pt --conf 0.4
+"""
+
 import argparse
+import os
 import time
+import urllib.request
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -7,253 +35,342 @@ from ultralytics import YOLO
 from sort import Sort
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Real-time Object Detection and Tracking with YOLO & SORT")
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="0",
-        help="Path to video file or webcam index (e.g. 0)",
+    p = argparse.ArgumentParser(
+        description="Real-time Object Detection & Tracking — YOLOv8 + SORT"
     )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="yolov8n.pt",
-        help="YOLO model path or name (e.g. yolov8n.pt, yolov8s.pt)",
-    )
-    parser.add_argument(
-        "--conf",
-        type=float,
-        default=0.25,
-        help="Confidence threshold for YOLO detections",
-    )
-    parser.add_argument(
-        "--classes",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Filter detections by class index (e.g. 0 for person)",
-    )
-    return parser.parse_args()
+    p.add_argument("--source",    type=str,   default="0",
+                   help="Webcam index (0) or path to video file")
+    p.add_argument("--model",     type=str,   default="yolov8n.pt",
+                   help="YOLO model name/path  (yolov8n.pt, yolov8s.pt, …)")
+    p.add_argument("--conf",      type=float, default=0.30,
+                   help="YOLO confidence threshold  (0–1)")
+    p.add_argument("--iou",       type=float, default=0.30,
+                   help="SORT IoU threshold for track matching  (0–1)")
+    p.add_argument("--max-age",   type=int,   default=30,
+                   help="Frames a track can go unmatched before deletion")
+    p.add_argument("--min-hits",  type=int,   default=2,
+                   help="Detections required before a track is displayed")
+    p.add_argument("--classes",   type=int,   nargs="+", default=None,
+                   help="COCO class indices to track (default: all)")
+    p.add_argument("--trail",     type=int,   default=20,
+                   help="Trail length in frames  (0 = off)")
+    p.add_argument("--benchmark", action="store_true",
+                   help="Print summary stats at the end")
+    p.add_argument("--no-count",  action="store_true",
+                   help="Hide the per-class object count overlay")
+    return p.parse_args()
 
 
-def draw_elegant_box(img, x1, y1, x2, y2, label, color, thickness=2, line_length=15):
+# ---------------------------------------------------------------------------
+# Colour palette — deterministic, never re-seeds global RNG
+# ---------------------------------------------------------------------------
+
+_COLOR_CACHE: dict[int, tuple] = {}
+
+def get_color(track_id: int) -> tuple:
+    if track_id not in _COLOR_CACHE:
+        rng = np.random.default_rng(int(track_id))          # isolated RNG
+        color = tuple(int(c) for c in rng.integers(60, 255, size=3))
+        _COLOR_CACHE[track_id] = color
+    return _COLOR_CACHE[track_id]
+
+
+# ---------------------------------------------------------------------------
+# Drawing helpers
+# ---------------------------------------------------------------------------
+
+def draw_box(img, x1, y1, x2, y2, label, color, line_len=14, thickness=2):
     """
-    Draws a premium bounding box with modern corner accents and a clean tag.
-    Handles boundary clamping to prevent tags from clipping off-screen.
+    Corner-accent bounding box with semi-transparent fill and label tag.
+    Handles near-edge objects without the label overflowing the frame.
     """
-    # Cast coordinate variables to integer
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+    H, W = img.shape[:2]
 
-    # Draw semi-transparent background fill for the box
+    # Clamp to frame
+    x1, x2 = max(0, x1), min(W - 1, x2)
+    y1, y2 = max(0, y1), min(H - 1, y2)
+
+    # Semi-transparent fill
     overlay = img.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-    cv2.addWeighted(overlay, 0.15, img, 0.85, 0, img)
+    cv2.addWeighted(overlay, 0.12, img, 0.88, 0, img)
 
-    # Draw main thin bounding box outline
+    # Thin border
     cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
 
-    # Draw thick corners for high-end look
-    # Top Left
-    cv2.line(img, (x1, y1), (x1 + line_length, y1), color, thickness)
-    cv2.line(img, (x1, y1), (x1, y1 + line_length), color, thickness)
-    # Top Right
-    cv2.line(img, (x2, y1), (x2 - line_length, y1), color, thickness)
-    cv2.line(img, (x2, y1), (x2, y1 + line_length), color, thickness)
-    # Bottom Left
-    cv2.line(img, (x1, y2), (x1 + line_length, y2), color, thickness)
-    cv2.line(img, (x1, y2), (x1, y2 - line_length), color, thickness)
-    # Bottom Right
-    cv2.line(img, (x2, y2), (x2 - line_length, y2), color, thickness)
-    cv2.line(img, (x2, y2), (x2, y2 - line_length), color, thickness)
+    # Corner accents
+    for sx, ex in [(x1, x1 + line_len), (x2, x2 - line_len)]:
+        for sy, ey in [(y1, y1 + line_len), (y2, y2 - line_len)]:
+            cv2.line(img, (sx, sy), (ex, sy), color, thickness)
+            cv2.line(img, (sx, sy), (sx, ey), color, thickness)
 
-    # Draw text tag above the box (or inside if near the top edge)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
-    text_thickness = 1
-    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, text_thickness)
+    # Label tag — clamp so it never goes off-screen
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.48
+    font_thick = 1
+    (tw, th), bl = cv2.getTextSize(label, font, font_scale, font_thick)
+    pad = 5
 
-    # Get frame dimensions to clamp horizontally
-    img_h, img_w = img.shape[:2]
-    text_x1 = max(0, min(x1, img_w - text_w - 10))
+    tag_x1 = max(0, min(x1, W - tw - pad * 2))
+    tag_x2 = tag_x1 + tw + pad * 2
+    tag_y2 = max(th + bl + pad, y1)
+    tag_y1 = tag_y2 - th - bl - pad
 
-    # Adjust vertical tag placement to prevent clipping at the top
-    if y1 < text_h + 15:
-        tag_y1 = y1
-        tag_y2 = y1 + text_h + 8
-        text_y = y1 + text_h + 3
-    else:
-        tag_y1 = y1 - text_h - 8
-        tag_y2 = y1
-        text_y = y1 - 5
+    cv2.rectangle(img, (tag_x1, tag_y1), (tag_x2, tag_y2), color, -1)
+    cv2.putText(img, label,
+                (tag_x1 + pad, tag_y2 - bl - 2),
+                font, font_scale, (255, 255, 255), font_thick, cv2.LINE_AA)
 
-    # Draw solid tag background
-    cv2.rectangle(img, (text_x1, tag_y1), (text_x1 + text_w + 10, tag_y2), color, -1)
-    # Draw text inside tag
-    cv2.putText(
-        img,
-        label,
-        (text_x1 + 5, text_y),
-        font,
-        font_scale,
-        (255, 255, 255),
-        text_thickness,
-        cv2.LINE_AA,
-    )
 
+def draw_trail(img, trail, color, length):
+    """Draw the last `length` positions as a fading polyline."""
+    pts = trail[-length:]
+    for i in range(1, len(pts)):
+        alpha = i / len(pts)
+        t_color = tuple(int(c * alpha) for c in color)
+        p1 = (int(pts[i - 1][0]), int(pts[i - 1][1]))
+        p2 = (int(pts[i][0]),     int(pts[i][1]))
+        cv2.line(img, p1, p2, t_color, 2, cv2.LINE_AA)
+
+
+def draw_hud(img, fps, class_counts, class_names, show_counts):
+    """Top-left HUD: FPS + per-class object counts."""
+    lines = [f"FPS: {fps:.1f}"]
+    if show_counts and class_counts:
+        for cls_id, cnt in sorted(class_counts.items()):
+            name = class_names.get(cls_id, f"cls{cls_id}")
+            lines.append(f"{name}: {cnt}")
+
+    pad, lh = 8, 20
+    box_h = pad * 2 + lh * len(lines)
+    box_w = 160
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (8, 8), (8 + box_w, 8 + box_h), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+
+    for i, line in enumerate(lines):
+        color = (0, 255, 127) if i == 0 else (220, 220, 220)
+        cv2.putText(img, line,
+                    (16, 8 + pad + (i + 1) * lh - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1, cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# Video source helper
+# ---------------------------------------------------------------------------
+
+SAMPLE_URL = (
+    "https://raw.githubusercontent.com/intel-iot-devkit/"
+    "sample-videos/master/person-bicycle-car-detection.mp4"
+)
+
+def open_source(source_str: str):
+    """
+    Open a cv2.VideoCapture from a string.
+    Falls back to a sample video if a webcam index fails.
+    """
+    source = int(source_str) if source_str.isdigit() else source_str
+
+    if isinstance(source, int):
+        cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            print(f"[INFO] Opened webcam index {source}")
+            return cap
+        print(f"[WARN] Could not open webcam {source}. Falling back to sample video.")
+        source = "sample.mp4"
+
+    if isinstance(source, str) and not os.path.exists(source):
+        print(f"[INFO] '{source}' not found — downloading sample video …")
+        try:
+            urllib.request.urlretrieve(SAMPLE_URL, source)
+            print("[INFO] Download complete.")
+        except Exception as e:
+            print(f"[ERROR] Download failed: {e}")
+            return None
+
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open: {source}")
+        return None
+
+    print(f"[INFO] Opened: {source}")
+    return cap
+
+
+# ---------------------------------------------------------------------------
+# Benchmark stats
+# ---------------------------------------------------------------------------
+
+class BenchmarkStats:
+    def __init__(self):
+        self.fps_samples       = []
+        self.max_simultaneous  = 0
+        self.id_switches       = 0          # proxy: new track IDs created after frame 1
+        self._prev_ids: set    = set()
+        self._first_frame      = True
+
+    def update(self, fps, track_ids: set):
+        self.fps_samples.append(fps)
+        self.max_simultaneous = max(self.max_simultaneous, len(track_ids))
+        if not self._first_frame:
+            new_ids = track_ids - self._prev_ids
+            self.id_switches += len(new_ids)
+        self._first_frame = False
+        self._prev_ids    = track_ids
+
+    def report(self):
+        if not self.fps_samples:
+            return
+        avg = np.mean(self.fps_samples)
+        mn  = np.min(self.fps_samples)
+        mx  = np.max(self.fps_samples)
+        print("\n" + "=" * 45)
+        print("  BENCHMARK RESULTS")
+        print("=" * 45)
+        print(f"  Average FPS        : {avg:.1f}")
+        print(f"  Min / Max FPS      : {mn:.1f} / {mx:.1f}")
+        print(f"  Max simultaneous   : {self.max_simultaneous} objects")
+        print(f"  New track IDs seen : {self.id_switches}")
+        print("=" * 45 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    # Determine input source
-    source = args.source
-    if source.isdigit():
-        source = int(source)
-
-    print(f"[INFO] Initializing webcam/video source: {source}...")
-    
-    # Use cv2.CAP_DSHOW backend on Windows for reliable webcam access
-    if isinstance(source, int):
-        cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-    else:
-        cap = cv2.VideoCapture(source)
-    
-    # Fallback to sample.mp4 if camera index fails to open
-    if not cap.isOpened() and isinstance(source, int):
-        print(f"[WARNING] Could not open webcam at index {source} with DirectShow. Falling back to 'sample.mp4'...")
-        source = "sample.mp4"
-        
-        # Automatically download sample.mp4 if it does not exist locally
-        import os
-        if not os.path.exists(source):
-            print("[INFO] 'sample.mp4' not found. Downloading sample video...")
-            url = "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4"
-            try:
-                import urllib.request
-                urllib.request.urlretrieve(url, source)
-                print("[INFO] Download completed successfully!")
-            except Exception as e:
-                print(f"[ERROR] Failed to download sample video: {e}")
-                
-        cap = cv2.VideoCapture(source)
-
-    if not cap.isOpened():
-        print(f"[ERROR] Could not open video source: {source}")
+    # --- Open video source ---
+    cap = open_source(args.source)
+    if cap is None:
         return
 
-    print(f"[INFO] Loading YOLO model: {args.model}...")
+    # --- Load model ---
+    print(f"[INFO] Loading model: {args.model} …")
     model = YOLO(args.model)
 
-    # Get class names dictionary from YOLO
+    # GPU if available, else CPU
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[INFO] Running inference on: {device.upper()}")
+
     class_names = model.names
 
-    # Initialize SORT tracker with corrected parameters
-    print("[INFO] Initializing SORT tracker...")
-    tracker = Sort(max_age=30, min_hits=1, iou_threshold=0.3)
+    # --- Init tracker ---
+    tracker = Sort(
+        max_age=args.max_age,
+        min_hits=args.min_hits,
+        iou_threshold=args.iou,
+    )
+    tracker.reset()     # ensures IDs start at 1 every run
 
-    # Define color map using a cache to avoid slow random-seed recomputations
-    COLOR_CACHE = {}
-    def get_color(track_id):
-        if track_id not in COLOR_CACHE:
-            np.random.seed(int(track_id))
-            color = np.random.randint(50, 255, size=3).tolist()
-            COLOR_CACHE[track_id] = tuple(color)
-        return COLOR_CACHE[track_id]
-
-    prev_time = 0
+    stats      = BenchmarkStats() if args.benchmark else None
+    prev_time  = time.time()
     out_writer = None
-    print("[INFO] Start processing. Press 'q' on the output window to quit.")
+    show_counts = not args.no_count
+
+    print("[INFO] Processing … press Q in the window to quit.\n")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("[INFO] Video stream ended or failed to read frame.")
             break
 
-        # Run YOLO detection
-        results = model(frame, verbose=False, conf=args.conf, classes=args.classes)[0]
+        # ---- Detection ----
+        results = model(
+            frame,
+            verbose=False,
+            conf=args.conf,
+            classes=args.classes,
+            device=device,
+            imgsz=640,
+        )[0]
 
-        # Extract detections: [x1, y1, x2, y2, confidence, class_id]
         dets = []
         for box in results.boxes:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf = box.conf[0].cpu().item()
-            cls = box.cls[0].cpu().item()
+            conf  = float(box.conf[0].cpu())
+            cls   = float(box.cls[0].cpu())
             dets.append([x1, y1, x2, y2, conf, cls])
 
-        dets = np.array(dets)
-        if len(dets) == 0:
-            dets = np.empty((0, 6))
+        dets = np.array(dets) if dets else np.empty((0, 6))
 
-        # Update SORT tracker
-        # sort.update accepts [[x1, y1, x2, y2, score, class_id], ...]
-        track_bbs_ids = tracker.update(dets)
+        # ---- Tracking ----
+        tracks = tracker.update(dets)   # (M, 6): x1,y1,x2,y2,id,class
 
-        # Draw bounding boxes and tracks
-        for track in track_bbs_ids:
-            x1, y1, x2, y2, track_id, class_id = track
-            track_id = int(track_id)
-            class_id = int(class_id)
-            
-            # Map class ID to class name
-            label_name = class_names.get(class_id, "Unknown")
-            label = f"ID {track_id} | {label_name}"
-            
-            color = get_color(track_id)
-            draw_elegant_box(frame, x1, y1, x2, y2, label, color)
+        # ---- Per-class count ----
+        class_counts: dict[int, int] = {}
+        current_ids: set = set()
 
-        # Calculate and display FPS
-        curr_time = time.time()
-        fps = 1.0 / (curr_time - prev_time) if prev_time > 0 else 0.0
-        prev_time = curr_time
+        for trk in tracks:
+            x1, y1, x2, y2, tid, cid = trk
+            tid = int(tid)
+            cid = int(cid)
+            current_ids.add(tid)
+            class_counts[cid] = class_counts.get(cid, 0) + 1
 
-        # Draw FPS overlay
-        cv2.rectangle(frame, (10, 10), (160, 45), (20, 20, 20), -1)
-        cv2.putText(
-            frame,
-            f"FPS: {fps:.1f}",
-            (20, 33),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 127),
-            2,
-            cv2.LINE_AA,
-        )
+            color = get_color(tid)
+            label = f"ID {tid} | {class_names.get(cid, '?')}"
 
-        # Display window or fallback to saving video in headless environments
+            draw_box(frame, x1, y1, x2, y2, label, color)
+
+            # Trail
+            if args.trail > 0:
+                trk_obj = next(
+                    (t for t in tracker.trackers if t.id + 1 == tid), None
+                )
+                if trk_obj and len(trk_obj.trail) > 1:
+                    draw_trail(frame, trk_obj.trail, color, args.trail)
+
+        # ---- FPS + HUD ----
+        now  = time.time()
+        fps  = 1.0 / max(now - prev_time, 1e-9)
+        prev_time = now
+
+        draw_hud(frame, fps, class_counts, class_names, show_counts)
+
+        if stats:
+            stats.update(fps, current_ids)
+
+        # ---- Display or write ----
         try:
-            cv2.imshow("Real-time Object Detection and Tracking (SORT)", frame)
-            # Handle keyboard input
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            cv2.imshow("Object Detection & Tracking  (Q to quit)", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
         except cv2.error:
-            # We are in a headless environment (like Codespaces)
             if out_writer is None:
-                height, width, _ = frame.shape
+                h, w = frame.shape[:2]
                 out_writer = cv2.VideoWriter(
                     "output.mp4",
-                    cv2.VideoWriter_fourcc(*'mp4v'),
-                    25.0,  # default FPS for output
-                    (width, height)
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    25.0, (w, h),
                 )
-                print("[INFO] Headless environment detected. Saving output to 'output.mp4'...")
-            
+                print("[INFO] Headless mode — writing to output.mp4")
             out_writer.write(frame)
-            # Check if we should quit (non-blocking in headless mode)
-            # In headless mode we process the whole video and then exit
-            pass
 
-    if out_writer is not None:
+    # ---- Cleanup ----
+    if out_writer:
         out_writer.release()
-        print("[INFO] Finished writing output to 'output.mp4'. You can now download and view it!")
+        print("[INFO] Saved output.mp4")
 
     cap.release()
     try:
         cv2.destroyAllWindows()
     except cv2.error:
         pass
-    print("[INFO] Cleanup complete. Exiting.")
+
+    if stats:
+        stats.report()
+
+    print("[INFO] Done.")
 
 
 if __name__ == "__main__":
