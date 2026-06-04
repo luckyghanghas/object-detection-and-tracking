@@ -1,17 +1,3 @@
-"""
-Real-time Object Detection and Tracking
-========================================
-YOLOv8  +  Custom SORT (Kalman Filter + Hungarian Assignment)
-
-Usage
------
-  python tracker_app.py                          # webcam
-  python tracker_app.py --source video.mp4       # video file
-  python tracker_app.py --source video.mp4 --benchmark
-  python tracker_app.py --classes 0 2            # person + car only
-  python tracker_app.py --model yolov8s.pt --conf 0.4
-"""
-
 import argparse
 import os
 import sys
