@@ -173,13 +173,10 @@ class KalmanBoxTracker:
             return np.array([x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2., score]).reshape((1, 5))
 
 
-def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
+def associate_detections_to_trackers(detections, trackers, det_classes, trk_classes, iou_threshold=0.3):
     """
     Assigns detections to tracked object (both represented as bounding boxes).
-    Returns:
-    - matches: numpy array of matches [detection_idx, tracker_idx]
-    - unmatched_detections: numpy array of indices of unmatched detections
-    - unmatched_trackers: numpy array of indices of unmatched trackers
+    Only allows matches between the same class.
     """
     if len(detections) == 0:
         return np.empty((0, 2), dtype=int), np.empty((0,), dtype=int), np.arange(len(trackers))
@@ -188,6 +185,12 @@ def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
         return np.empty((0, 2), dtype=int), np.arange(len(detections)), np.empty((0,), dtype=int)
 
     iou_matrix = iou_batch(detections, trackers)
+
+    # Enforce same-class matching by zeroing out IoU for mismatched classes
+    for d in range(len(detections)):
+        for t in range(len(trackers)):
+            if det_classes[d] != trk_classes[t]:
+                iou_matrix[d, t] = 0.0
 
     if min(iou_matrix.shape) > 0:
         a = (iou_matrix > iou_threshold)
@@ -263,8 +266,12 @@ class Sort:
         else:
             dets_boxes = dets
 
+        # Extract classes for same-class matching constraints
+        det_classes = dets[:, 5] if dets.shape[1] > 5 else np.array([-1] * len(dets))
+        trk_classes = np.array([tracker.class_id for tracker in self.trackers])
+
         matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(
-            dets_boxes, trks[:, :4], self.iou_threshold
+            dets_boxes, trks[:, :4], det_classes, trk_classes, self.iou_threshold
         )
 
         # Update matched trackers with assigned detections
