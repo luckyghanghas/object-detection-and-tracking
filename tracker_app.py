@@ -3,17 +3,6 @@ Real-time Object Detection and Tracking
 ========================================
 YOLOv8  +  Custom SORT (Kalman Filter + Hungarian Assignment)
 
-Features
---------
-  - Webcam or video file input
-  - GPU acceleration when available (auto-detected)
-  - Elegant corner-accent bounding boxes, per-ID colour
-  - Motion trail (last N centre points per track)
-  - Per-class object count overlay
-  - Benchmark mode: prints FPS, ID-switch count, max simultaneous tracks
-  - Headless mode: writes output.mp4 when no display is available
-  - Tracker resets between runs (no ID bleed-over)
-
 Usage
 -----
   python tracker_app.py                          # webcam
@@ -48,14 +37,14 @@ def parse_args():
     p.add_argument("--source",    type=str,   default="0",
                    help="Webcam index (0) or path to video file")
     p.add_argument("--model",     type=str,   default="yolov8n.pt",
-                   help="YOLO model name/path  (yolov8n.pt, yolov8s.pt, …)")
+                   help="YOLO model name/path  (yolov8n.pt, yolov8s.pt, ...)")
     p.add_argument("--conf",      type=float, default=0.30,
-                   help="YOLO confidence threshold  (0–1)")
-    p.add_argument("--iou",       type=float, default=0.30,
-                   help="SORT IoU threshold for track matching  (0–1)")
-    p.add_argument("--max-age",   type=int,   default=30,
+                   help="YOLO confidence threshold  (0-1)")
+    p.add_argument("--iou",       type=float, default=0.15,
+                   help="SORT IoU threshold for track matching  (0-1)")
+    p.add_argument("--max-age",   type=int,   default=50,
                    help="Frames a track can go unmatched before deletion")
-    p.add_argument("--min-hits",  type=int,   default=2,
+    p.add_argument("--min-hits",  type=int,   default=1,
                    help="Detections required before a track is displayed")
     p.add_argument("--classes",   type=int,   nargs="+", default=None,
                    help="COCO class indices to track (default: all)")
@@ -69,7 +58,7 @@ def parse_args():
 
 
 # ---------------------------------------------------------------------------
-# Colour palette — deterministic, never re-seeds global RNG
+# Colour palette
 # ---------------------------------------------------------------------------
 
 _COLOR_CACHE: "dict[int, tuple]" = {}
@@ -87,32 +76,23 @@ def get_color(track_id: int) -> tuple:
 # ---------------------------------------------------------------------------
 
 def draw_box(img, x1, y1, x2, y2, label, color, line_len=14, thickness=2):
-    """
-    Corner-accent bounding box with semi-transparent fill and label tag.
-    Handles near-edge objects without the label overflowing the frame.
-    """
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
     H, W = img.shape[:2]
 
-    # Clamp to frame
     x1, x2 = max(0, x1), min(W - 1, x2)
     y1, y2 = max(0, y1), min(H - 1, y2)
 
-    # Semi-transparent fill
     overlay = img.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
     cv2.addWeighted(overlay, 0.12, img, 0.88, 0, img)
 
-    # Thin border
     cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
 
-    # Corner accents
     for sx, ex in [(x1, x1 + line_len), (x2, x2 - line_len)]:
         for sy, ey in [(y1, y1 + line_len), (y2, y2 - line_len)]:
             cv2.line(img, (sx, sy), (ex, sy), color, thickness)
             cv2.line(img, (sx, sy), (sx, ey), color, thickness)
 
-    # Label tag — clamp so it never goes off-screen
     font       = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.48
     font_thick = 1
@@ -131,7 +111,6 @@ def draw_box(img, x1, y1, x2, y2, label, color, line_len=14, thickness=2):
 
 
 def draw_trail(img, trail, color, length):
-    """Draw the last `length` positions as a fading polyline."""
     pts = trail[-length:]
     for i in range(1, len(pts)):
         alpha = i / len(pts)
@@ -142,7 +121,6 @@ def draw_trail(img, trail, color, length):
 
 
 def draw_hud(img, fps, class_counts, class_names, show_counts):
-    """Top-left HUD: FPS + per-class object counts."""
     if class_names is None:
         class_names = {}
     lines = [f"FPS: {fps:.1f}"]
@@ -176,14 +154,9 @@ SAMPLE_URL = (
 )
 
 def open_source(source_str: str):
-    """
-    Open a cv2.VideoCapture from a string.
-    Falls back to a sample video if a webcam index fails.
-    """
     source = int(source_str) if source_str.isdigit() else source_str
 
     if isinstance(source, int):
-        # CAP_DSHOW is Windows-only; use default backend on other platforms
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         cap = cv2.VideoCapture(source, backend)
         if cap.isOpened():
@@ -193,7 +166,7 @@ def open_source(source_str: str):
         source = "sample.mp4"
 
     if isinstance(source, str) and not os.path.exists(source):
-        print(f"[INFO] '{source}' not found — downloading sample video …")
+        print(f"[INFO] '{source}' not found — downloading sample video ...")
         try:
             urllib.request.urlretrieve(SAMPLE_URL, source)
             print("[INFO] Download complete.")
@@ -216,18 +189,17 @@ def open_source(source_str: str):
 
 class BenchmarkStats:
     def __init__(self):
-        self.fps_samples       = []
-        self.max_simultaneous  = 0
-        self.id_switches       = 0
-        self._prev_ids: set    = set()
-        self._first_frame      = True
+        self.fps_samples      = []
+        self.max_simultaneous = 0
+        self.id_switches      = 0
+        self._prev_ids: set   = set()
+        self._first_frame     = True
 
     def update(self, fps, track_ids: set):
         self.fps_samples.append(fps)
         self.max_simultaneous = max(self.max_simultaneous, len(track_ids))
         if not self._first_frame:
-            new_ids = track_ids - self._prev_ids
-            self.id_switches += len(new_ids)
+            self.id_switches += len(track_ids - self._prev_ids)
         self._first_frame = False
         self._prev_ids    = track_ids
 
@@ -254,35 +226,31 @@ class BenchmarkStats:
 def main():
     args = parse_args()
 
-    # --- Open video source ---
     cap = open_source(args.source)
     if cap is None:
         return
 
-    # --- Load model ---
-    print(f"[INFO] Loading model: {args.model} …")
+    print(f"[INFO] Loading model: {args.model} ...")
     model = YOLO(args.model)
 
-    # GPU if available, else CPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[INFO] Running inference on: {device.upper()}")
 
     class_names: dict = model.names or {}
 
-    # --- Init tracker ---
     tracker = Sort(
         max_age=args.max_age,
         min_hits=args.min_hits,
         iou_threshold=args.iou,
     )
-    tracker.reset()     # ensures IDs start at 1 every run
+    tracker.reset()
 
     stats       = BenchmarkStats() if args.benchmark else None
     prev_time   = time.time()
     out_writer  = None
     show_counts = not args.no_count
 
-    print("[INFO] Processing … press Q in the window to quit.\n")
+    print("[INFO] Processing ... press Q in the window to quit.\n")
 
     while True:
         ret, frame = cap.read()
@@ -302,16 +270,16 @@ def main():
         dets = []
         for box in results.boxes:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf  = float(box.conf[0].cpu())
-            cls   = float(box.cls[0].cpu())
+            conf = float(box.conf[0].cpu())
+            cls  = float(box.cls[0].cpu())
             dets.append([x1, y1, x2, y2, conf, cls])
 
         dets = np.array(dets) if dets else np.empty((0, 6))
 
         # ---- Tracking ----
-        tracks = tracker.update(dets)   # (M, 6): x1,y1,x2,y2,id,class
+        tracks = tracker.update(dets)
 
-        # ---- Per-class count ----
+        # ---- Draw ----
         class_counts: "dict[int, int]" = {}
         current_ids:  "set[int]"       = set()
 
@@ -324,10 +292,8 @@ def main():
 
             color = get_color(tid)
             label = f"ID {tid} | {class_names.get(cid, '?')}"
-
             draw_box(frame, x1, y1, x2, y2, label, color)
 
-            # Trail
             if args.trail > 0:
                 trk_obj = next(
                     (t for t in tracker.trackers if t.id + 1 == tid), None
@@ -335,11 +301,10 @@ def main():
                 if trk_obj and len(trk_obj.trail) > 1:
                     draw_trail(frame, trk_obj.trail, color, args.trail)
 
-        # ---- FPS + HUD ----
+        # ---- HUD ----
         now  = time.time()
         fps  = 1.0 / max(now - prev_time, 1e-9)
         prev_time = now
-
         draw_hud(frame, fps, class_counts, class_names, show_counts)
 
         if stats:
@@ -352,13 +317,20 @@ def main():
                 break
         except cv2.error:
             if out_writer is None:
-                h, w = frame.shape[:2]
-                out_writer = cv2.VideoWriter(
-                    "output.mp4",
-                    cv2.VideoWriter_fourcc(*"mp4v"),
-                    25.0, (w, h),
-                )
-                print("[INFO] Headless mode — writing to output.mp4")
+                h, w    = frame.shape[:2]
+                src_fps = cap.get(cv2.CAP_PROP_FPS)
+                fps_out = src_fps if src_fps > 0 else 25.0
+
+                # Try H.264 first (plays on Windows/Mac/Linux without extra codecs)
+                fourcc     = cv2.VideoWriter_fourcc(*"avc1")
+                out_writer = cv2.VideoWriter("output.mp4", fourcc, fps_out, (w, h))
+                if not out_writer.isOpened():
+                    out_writer.release()
+                    fourcc     = cv2.VideoWriter_fourcc(*"mp4v")
+                    out_writer = cv2.VideoWriter("output.mp4", fourcc, fps_out, (w, h))
+                    print("[INFO] Headless mode — writing output.mp4 (mp4v codec)")
+                else:
+                    print("[INFO] Headless mode — writing output.mp4 (H.264 codec)")
             out_writer.write(frame)
 
     # ---- Cleanup ----
