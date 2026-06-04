@@ -25,11 +25,13 @@ Usage
 
 import argparse
 import os
+import sys
 import time
 import urllib.request
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 from sort import Sort
@@ -70,11 +72,11 @@ def parse_args():
 # Colour palette — deterministic, never re-seeds global RNG
 # ---------------------------------------------------------------------------
 
-_COLOR_CACHE: dict[int, tuple] = {}
+_COLOR_CACHE: "dict[int, tuple]" = {}
 
 def get_color(track_id: int) -> tuple:
     if track_id not in _COLOR_CACHE:
-        rng = np.random.default_rng(int(track_id))          # isolated RNG
+        rng = np.random.default_rng(int(track_id))
         color = tuple(int(c) for c in rng.integers(60, 255, size=3))
         _COLOR_CACHE[track_id] = color
     return _COLOR_CACHE[track_id]
@@ -141,6 +143,8 @@ def draw_trail(img, trail, color, length):
 
 def draw_hud(img, fps, class_counts, class_names, show_counts):
     """Top-left HUD: FPS + per-class object counts."""
+    if class_names is None:
+        class_names = {}
     lines = [f"FPS: {fps:.1f}"]
     if show_counts and class_counts:
         for cls_id, cnt in sorted(class_counts.items()):
@@ -179,7 +183,9 @@ def open_source(source_str: str):
     source = int(source_str) if source_str.isdigit() else source_str
 
     if isinstance(source, int):
-        cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        # CAP_DSHOW is Windows-only; use default backend on other platforms
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(source, backend)
         if cap.isOpened():
             print(f"[INFO] Opened webcam index {source}")
             return cap
@@ -212,7 +218,7 @@ class BenchmarkStats:
     def __init__(self):
         self.fps_samples       = []
         self.max_simultaneous  = 0
-        self.id_switches       = 0          # proxy: new track IDs created after frame 1
+        self.id_switches       = 0
         self._prev_ids: set    = set()
         self._first_frame      = True
 
@@ -258,11 +264,10 @@ def main():
     model = YOLO(args.model)
 
     # GPU if available, else CPU
-    import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[INFO] Running inference on: {device.upper()}")
 
-    class_names = model.names
+    class_names: dict = model.names or {}
 
     # --- Init tracker ---
     tracker = Sort(
@@ -272,9 +277,9 @@ def main():
     )
     tracker.reset()     # ensures IDs start at 1 every run
 
-    stats      = BenchmarkStats() if args.benchmark else None
-    prev_time  = time.time()
-    out_writer = None
+    stats       = BenchmarkStats() if args.benchmark else None
+    prev_time   = time.time()
+    out_writer  = None
     show_counts = not args.no_count
 
     print("[INFO] Processing … press Q in the window to quit.\n")
@@ -307,8 +312,8 @@ def main():
         tracks = tracker.update(dets)   # (M, 6): x1,y1,x2,y2,id,class
 
         # ---- Per-class count ----
-        class_counts: dict[int, int] = {}
-        current_ids: set = set()
+        class_counts: "dict[int, int]" = {}
+        current_ids:  "set[int]"       = set()
 
         for trk in tracks:
             x1, y1, x2, y2, tid, cid = trk
