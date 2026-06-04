@@ -1,15 +1,12 @@
 """
 SORT: Simple Online and Realtime Tracking
-Custom NumPy/SciPy implementation with class-aware matching and velocity constraints.
+Custom NumPy/SciPy implementation with class-aware matching.
 
-Fixes in this version:
-  - IoU threshold lowered to 0.2 (was 0.3) — prevents ID switches on partial occlusion
-  - min_hits default = 1 — labels appear on first confirmed detection
-  - Same-class check uses int cast to avoid float comparison mismatch (e.g. 0.0 != 0)
-  - Tracker class_id initialised to -1; class check skipped when either side is -1
-  - Velocity penalty removed entirely — was killing valid matches on slow objects
-  - _x_to_bbox flattens (7,1) state vector before indexing (fixes TypeError)
-  - predict() uses [row, 0] indexing throughout for safety
+Key parameters tuned for stable IDs:
+  - iou_threshold = 0.15  (low → tolerates partial occlusion & uncertain Kalman predictions)
+  - max_age       = 50    (long → track survives brief disappearances instead of respawning)
+  - min_hits      = 1     (label appears immediately on first detection)
+  - Class blocking deferred until a tracker has >= 5 hits (class label unreliable early on)
 """
 
 import numpy as np
@@ -34,8 +31,10 @@ def iou_batch(bb_test, bb_gt):
     h     = np.maximum(0., yy2 - yy1)
     inter = w * h
 
-    area_test = (bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1])
-    area_gt   = (bb_gt[...,   2] - bb_gt[...,   0]) * (bb_gt[...,   3] - bb_gt[...,   1])
+    area_test = ((bb_test[..., 2] - bb_test[..., 0]) *
+                 (bb_test[..., 3] - bb_test[..., 1]))
+    area_gt   = ((bb_gt[...,   2] - bb_gt[...,   0]) *
+                 (bb_gt[...,   3] - bb_gt[...,   1]))
 
     return inter / (area_test + area_gt - inter + 1e-9)
 
@@ -138,7 +137,7 @@ class KalmanBoxTracker:
 
     @staticmethod
     def _x_to_bbox(x):
-        x = x.flatten()          # (7,1) → (7,) so x[i] is a scalar
+        x = x.flatten()          # (7,1) → (7,) so x[i] is always a scalar
         s = float(x[2])
         r = float(x[3])
         r = max(r, 1e-6)
@@ -155,7 +154,7 @@ class KalmanBoxTracker:
 def associate_detections_to_trackers(detections, trackers,
                                      det_classes, trk_classes,
                                      active_trackers,
-                                     iou_threshold=0.2):
+                                     iou_threshold=0.15):
     n_det = len(detections)
     n_trk = len(trackers)
 
@@ -170,20 +169,23 @@ def associate_detections_to_trackers(detections, trackers,
 
     iou_matrix = iou_batch(detections, trackers)
 
-    # Block cross-class pairs only when BOTH sides have a known class (>= 0)
     for d in range(n_det):
         dc = int(det_classes[d])
         for t in range(n_trk):
-            tc = int(trk_classes[t])
-            if dc >= 0 and tc >= 0 and dc != tc:
+            tc  = int(trk_classes[t])
+            trk = active_trackers[t]
+            # Enforce class only after tracker has >= 5 reliable hits
+            if dc >= 0 and tc >= 0 and dc != tc and trk.hits >= 5:
                 iou_matrix[d, t] = 0.0
 
     matched_indices = (linear_assignment(-iou_matrix)
                        if iou_matrix.size > 0
                        else np.empty((0, 2), dtype=int))
 
-    matched_det_set = set(matched_indices[:, 0].tolist()) if len(matched_indices) else set()
-    matched_trk_set = set(matched_indices[:, 1].tolist()) if len(matched_indices) else set()
+    matched_det_set = (set(matched_indices[:, 0].tolist())
+                       if len(matched_indices) else set())
+    matched_trk_set = (set(matched_indices[:, 1].tolist())
+                       if len(matched_indices) else set())
 
     unmatched_dets = [d for d in range(n_det) if d not in matched_det_set]
     unmatched_trks = [t for t in range(n_trk) if t not in matched_trk_set]
@@ -205,7 +207,7 @@ def associate_detections_to_trackers(detections, trackers,
 
 
 class Sort:
-    def __init__(self, max_age=30, min_hits=1, iou_threshold=0.2):
+    def __init__(self, max_age=50, min_hits=1, iou_threshold=0.15):
         self.max_age       = max_age
         self.min_hits      = min_hits
         self.iou_threshold = iou_threshold
