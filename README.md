@@ -42,11 +42,15 @@ You can run the tracking app using `tracker_app.py`. By default, it will attempt
 python tracker_app.py
 ```
 
-### 2. Video File Tracking
-Specify a video file path using the `--source` option:
+### 2. Video File Tracking (Demo Video)
+For testing, you can download this standard [Intel Sample Video](https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4) (contains people, cars, and bicycles).
+
+Run the tracker on the downloaded video:
 ```bash
 python tracker_app.py --source "path/to/your/video.mp4"
 ```
+
+*Note: If you run `python tracker_app.py` and don't have a webcam connected, the application will automatically download and use this sample video as a fallback.*
 
 ### 3. Track Specific Classes
 You can filter detections to only track specific classes (e.g., class `0` is for `person` in the COCO dataset):
