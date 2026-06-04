@@ -148,6 +148,7 @@ def main():
         return tuple(color)
 
     prev_time = 0
+    out_writer = None
     print("[INFO] Start processing. Press 'q' on the output window to quit.")
 
     while True:
@@ -206,16 +207,39 @@ def main():
             cv2.LINE_AA,
         )
 
-        # Display window
-        cv2.imshow("Real-time Object Detection and Tracking (SORT)", frame)
+        # Display window or fallback to saving video in headless environments
+        try:
+            cv2.imshow("Real-time Object Detection and Tracking (SORT)", frame)
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+        except cv2.error:
+            # We are in a headless environment (like Codespaces)
+            if out_writer is None:
+                height, width, _ = frame.shape
+                out_writer = cv2.VideoWriter(
+                    "output.mp4",
+                    cv2.VideoWriter_fourcc(*'mp4v'),
+                    25.0,  # default FPS for output
+                    (width, height)
+                )
+                print("[INFO] Headless environment detected. Saving output to 'output.mp4'...")
+            
+            out_writer.write(frame)
+            # Check if we should quit (non-blocking in headless mode)
+            # In headless mode we process the whole video and then exit
+            pass
 
-        # Handle keyboard input
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
+    if out_writer is not None:
+        out_writer.release()
+        print("[INFO] Finished writing output to 'output.mp4'. You can now download and view it!")
 
     cap.release()
-    cv2.destroyAllWindows()
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error:
+        pass
     print("[INFO] Cleanup complete. Exiting.")
 
 
